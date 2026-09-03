@@ -1,18 +1,21 @@
 import os
 import json
 import requests
+import httpx
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import google.generativeai as genai
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 
 # INIT ------------
 load_dotenv()
 
-gemini_key = os.getenv("GEMINI_API_KEY")
-if gemini_key:
-    genai.configure(api_key=gemini_key)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 app = FastAPI(title="Gasolineras IA API", version="1.0.0")
 app.add_middleware(
@@ -24,6 +27,29 @@ app.add_middleware(
 )
 api_url = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/"
 
+engine = None
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
+    try:
+        engine = create_engine(
+            DATABASE_URL,
+            pool_pre_ping=True,
+            connect_args={"sslmode": "require"}
+        )
+    except Exception as e:
+        print(f"Error al inicializar el engine de SQLAlchemy: {e}")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
 # FUNCTIONS ------------
 def parse_price(val):
     return float(val.replace(",", ".")) if val else None
@@ -32,8 +58,8 @@ def normalize_station(station):
     return {
         "id": station.get("IDEESS"),
         "label": station.get("Rótulo", None).strip(),
-        "city": station.get("Municipio", None).strip(),
-        "prov": station.get("Provincia", "").strip(),
+        "city": station.get("Municipio", None).strip().lower(),
+        "prov": station.get("Provincia", "").strip().lower(),
         "cp": station.get("C.P.", None),
         "address": station.get("Dirección", None).strip(),
         "longitude": station.get("Longitud (WGS84)", None),
@@ -86,7 +112,7 @@ def get_province_ai_report(
     response = requests.get(api_url)
     if response.status_code == 200:
         data = response.json()
-        stationsFilter, error = [normalize_station(station) for station in data.get("ListaEESSPrecio", []) if station.get("Provincia", "").strip().lower() == prov.lower()], None
+        stationsFilter, error = [normalize_station(station) for station in data.get("ListaEESSPrecio", []) if station.get("Provincia", "") == prov.lower()], None
         if error:
             raise HTTPException(status_code=500, detail=error)
 
@@ -125,11 +151,66 @@ def get_province_ai_report(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error al generar informe con IA: {str(e)}")
 
-@app.get("/api/cron/update-data")
+@app.get("/cron/update-data")
 def cron_update_gas_stations(authorization: Optional[str] = Header(None)):
-    cron_secret = os.getenv("CRON_SECRET")
-    if cron_secret and authorization != f"Bearer {cron_secret}":
-        raise HTTPException(status_code=401, detail="No autorizado")
+    # cron_secret = os.getenv("CRON_SECRET")
+    # if cron_secret and authorization != f"Bearer {cron_secret}":
+    #     raise HTTPException(status_code=401, detail="No autorizado")
 
-    # TODO: BBDD
-    return {"status": "success", "message": "Proceso de actualización ejecutado"}
+    if not engine:
+        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
+
+    with httpx.Client(headers=HEADERS, timeout=30.0, follow_redirects=True) as client:
+        res = client.get(api_url)
+        res.raise_for_status()
+        data = res.json()
+        raw_stations = [normalize_station(station) for station in data.get("ListaEESSPrecio", [])]
+
+        with engine.begin() as conn:
+            for raw in raw_stations:
+                st = raw
+                if not st["id"]:
+                    continue
+
+                # 1. Upsert en tabla estaciones
+                conn.execute(
+                    text("""
+                        INSERT INTO estaciones (id, label, city, prov, cp, address, latitude, longitude, hours)
+                        VALUES (:id, :label, :city, :prov, :cp, :address, :latitude, :longitude, :hours)
+                        ON CONFLICT (id) DO UPDATE SET
+                            label = EXCLUDED.label,
+                            city = EXCLUDED.city,
+                            prov = EXCLUDED.prov,
+                            address = EXCLUDED.address,
+                            hours = EXCLUDED.hours,
+                            updated_at = CURRENT_TIMESTAMP;
+                    """),
+                    {
+                        "id": st["id"],
+                        "label": st["label"],
+                        "city": st["city"],
+                        "prov": st["prov"],
+                        "cp": st["cp"],
+                        "address": st["address"],
+                        "latitude": st["latitude"],
+                        "longitude": st["longitude"],
+                        "hours": st["hours"],
+                    }
+                )
+
+                # 2. Upsert en tabla precios usando el diccionario de precios convertido a JSON
+                conn.execute(
+                    text("""
+                        INSERT INTO precios (estacion_id, prices)
+                        VALUES (:estacion_id, :prices::jsonb)
+                        ON CONFLICT (estacion_id) DO UPDATE SET
+                            prices = EXCLUDED.prices,
+                            updated_at = CURRENT_TIMESTAMP;
+                    """),
+                    {
+                        "estacion_id": st["id"],
+                        "prices": json.dumps(st["prices"])
+                    }
+                )
+
+        return {"status": "success", "total_procesadas": len(raw_stations)}
