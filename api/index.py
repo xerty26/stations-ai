@@ -54,6 +54,14 @@ HEADERS = {
 def parse_price(val):
     return float(val.replace(",", ".")) if val else None
 
+def parse_coord(val):
+    if not val:
+        return None
+    try:
+        return float(str(val).replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+
 def normalize_station(station):
     return {
         "id": station.get("IDEESS"),
@@ -62,8 +70,8 @@ def normalize_station(station):
         "prov": station.get("Provincia", "").strip().lower(),
         "cp": station.get("C.P.", None),
         "address": station.get("Dirección", None).strip(),
-        "longitude": station.get("Longitud (WGS84)", None),
-        "latitude": station.get("Latitud", None),
+        "longitude": parse_coord(station.get("Longitud (WGS84)", None)),
+        "latitude": parse_coord(station.get("Latitud", None)),
         "prices": {
             "adblue": parse_price(station.get("Precio Adblue", None)),
             "amoniaco": parse_price(station.get("Precio Amoniaco", None)),
@@ -181,7 +189,10 @@ def cron_update_gas_stations(authorization: Optional[str] = Header(None)):
                             label = EXCLUDED.label,
                             city = EXCLUDED.city,
                             prov = EXCLUDED.prov,
+                            cp = EXCLUDED.cp,
                             address = EXCLUDED.address,
+                            latitude = EXCLUDED.latitude,
+                            longitude = EXCLUDED.longitude,
                             hours = EXCLUDED.hours,
                             updated_at = CURRENT_TIMESTAMP;
                     """),
