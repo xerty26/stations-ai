@@ -3,6 +3,7 @@ import json
 import requests
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import google.generativeai as genai
 
@@ -14,6 +15,13 @@ if gemini_key:
     genai.configure(api_key=gemini_key)
 
 app = FastAPI(title="Gasolineras IA API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 api_url = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/"
 
 # FUNCTIONS ------------
@@ -61,11 +69,15 @@ def normalize_station(station):
 
 # ROUTES ------------
 
-@app.get("/api/health")
+@app.get("/")
+def home():
+    return {"message": "Gasolineras IA API activa"}
+
+@app.get("/health")
 def health_check():
     return {"status": "ok", "service": "FastAPI + Gemini on Vercel"}
 
-@app.get("/api/stations/{prov}/report")
+@app.get("/stations/{prov}/report")
 def get_province_ai_report(
     prov: str = "madrid", 
     gasoline_type: str = "gasolina_95_e5"
