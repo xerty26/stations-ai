@@ -1,14 +1,14 @@
 import os
 import json
-import requests
-import httpx
+import time
+import io
+import secrets
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import google.generativeai as genai
 from sqlalchemy import create_engine, text
-from sqlalchemy.pool import NullPool
 from curl_cffi import requests as curl_requests
 
 # INIT ------------
@@ -26,7 +26,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-api_url = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/"
+api_url = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/FiltroProvincia/"
 
 engine = None
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -51,17 +51,76 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+PROVINCIA_IDS = {
+    # "01": "Araba/Álava",
+    # "02": "Albacete",
+    # "03": "Alicante/Alacant",
+    # "04": "Almería",
+    # "05": "Ávila",
+    # "06": "Badajoz",
+    # "07": "Balears (Illes)",
+    #"08": "Barcelona",
+    # "09": "Burgos",
+    # "10": "Cáceres",
+    # "11": "Cádiz",
+    # "12": "Castellón/Castelló",
+    # "13": "Ciudad Real",
+    # "14": "Córdoba",
+    # "15": "Coruña (A)",
+    # "16": "Cuenca",
+    # "17": "Girona",
+    # "18": "Granada",
+    # "19": "Guadalajara",
+    # "20": "Gipuzkoa",
+    # "21": "Huelva",
+    # "22": "Huesca",
+    # "23": "Jaén",
+    # "24": "León",
+    # "25": "Lleida",
+    # "26": "Rioja (La)",
+    # "27": "Lugo",
+    "28": "Madrid",
+    # "29": "Málaga",
+    # "30": "Murcia",
+    # "31": "Navarra",
+    # "32": "Ourense",
+    # "33": "Asturias",
+    # "34": "Palencia",
+    # "35": "Palmas (Las)",
+    # "36": "Pontevedra",
+    # "37": "Salamanca",
+    # "38": "Santa Cruz de Tenerife",
+    # "39": "Cantabria",
+    # "40": "Segovia",
+    # "41": "Sevilla",
+    # "42": "Soria",
+    # "43": "Tarragona",
+    # "44": "Teruel",
+    "45": "Toledo",
+    # "46": "Valencia/València",
+    # "47": "Valladolid",
+    # "48": "Bizkaia",
+    # "49": "Zamora",
+    # "50": "Zaragoza",
+    # "51": "Ceuta",
+    # "52": "Melilla"
+}
+
 # FUNCTIONS ------------
 
-def fetch_ministerio_data(url: str):
+def fetch_ministerio(provincia_id):
     response = curl_requests.get(
-        url, 
+        f"{api_url}/{provincia_id}", 
         impersonate="chrome120", 
         timeout=30,
         headers=HEADERS
     )
     response.raise_for_status()
     return response.json()
+
+def chunk_list(data_list, chunk_size=1000):
+    for i in range(0, len(data_list), chunk_size):
+        yield data_list[i:i + chunk_size]
 
 def parse_price(val):
     return float(val.replace(",", ".")) if val else None
@@ -112,6 +171,73 @@ def normalize_station(station):
         "hours": station.get("Horario", None).strip() if station.get("Horario") else None,
     }
 
+def process_all_provinces():
+    if not engine:
+        print("[CRON] Error: DATABASE_URL no configurada")
+        return
+
+    print("[CRON] Iniciando actualización completa de España...")
+    total_procesadas = 0
+
+    stmt_estaciones = text("""
+        INSERT INTO estaciones (id, label, city, prov, cp, address, latitude, longitude, hours)
+        VALUES (:id, :label, :city, :prov, :cp, :address, :latitude, :longitude, :hours)
+        ON CONFLICT (id) DO UPDATE SET
+            label = EXCLUDED.label,
+            city = EXCLUDED.city,
+            prov = EXCLUDED.prov,
+            cp = EXCLUDED.cp,
+            address = EXCLUDED.address,
+            latitude = EXCLUDED.latitude,
+            longitude = EXCLUDED.longitude,
+            hours = EXCLUDED.hours,
+            updated_at = CURRENT_TIMESTAMP;
+    """)
+
+    stmt_precios = text("""
+        INSERT INTO precios (estacion_id, prices)
+        VALUES (:estacion_id, CAST(:prices AS jsonb))
+        ON CONFLICT (estacion_id) DO UPDATE SET
+            prices = EXCLUDED.prices,
+            updated_at = CURRENT_TIMESTAMP;
+    """)
+
+    for prov_id in PROVINCIA_IDS:
+        try:
+            data = fetch_ministerio(prov_id)
+            raw_stations = [normalize_station(st) for st in data.get("ListaEESSPrecio", []) if st and st.get("IDEESS")]
+
+            batch_estaciones = [
+                {
+                    "id": st["id"], "label": st["label"], "city": st["city"],
+                    "prov": st["prov"], "cp": st["cp"], "address": st["address"],
+                    "latitude": st["latitude"], "longitude": st["longitude"], "hours": st["hours"]
+                }
+                for st in raw_stations if st.get("id")
+            ]
+
+            batch_precios = [
+                {
+                    "estacion_id": st["id"],
+                    "prices": json.dumps(st["prices"])
+                }
+                for st in raw_stations if st.get("id")
+            ]
+
+            with engine.begin() as conn:
+                if batch_estaciones:
+                    conn.execute(stmt_estaciones, batch_estaciones)
+                if batch_precios:
+                    conn.execute(stmt_precios, batch_precios)
+
+            total_procesadas += len(raw_stations)
+            time.sleep(0.1)
+
+        except Exception as e:
+            print(f"[CRON] Error procesando provincia {prov_id}: {e}")
+
+    print(f"[CRON] Finalizada actualización nacional. Total estaciones: {total_procesadas}")
+
 
 # ROUTES ------------
 
@@ -123,118 +249,182 @@ def home():
 def health_check():
     return {"status": "ok", "service": "FastAPI + Gemini on Vercel"}
 
-@app.get("/stations/{prov}/report")
+@app.get("/stations/nearby/report")
 def get_province_ai_report(
-    prov: str = "madrid", 
-    gasoline_type: str = "gasolina_95_e5"
+    user_lat: float = 40.252125,
+    user_lng: float = -4.189412,
+    radius_km: float = 30,
+    fuel: str = "gasolina_95_e5"
 ):
+    if not engine:
+        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
+
+    query_sql = text("""
+        WITH estaciones_distancia AS (
+            SELECT 
+                e.id,
+                e.label,
+                e.city,
+                e.prov,
+                e.address,
+                e.hours,
+                e.latitude,
+                e.longitude,
+                p.prices,
+                (
+                    6371 * acos(
+                        LEAST(1.0, GREATEST(-1.0,
+                            cos(radians(:user_lat)) * cos(radians(CAST(e.latitude AS double precision))) *
+                            cos(radians(CAST(e.longitude AS double precision)) - radians(:user_lng)) +
+                            sin(radians(:user_lat)) * sin(radians(CAST(e.latitude AS double precision)))
+                        ))
+                    )
+                ) AS distancia_km
+            FROM estaciones e
+            JOIN precios p ON e.id = p.estacion_id
+            WHERE e.latitude IS NOT NULL AND e.longitude IS NOT NULL
+        )
+        SELECT * FROM estaciones_distancia
+        WHERE distancia_km <= :radius_km
+        ORDER BY distancia_km ASC;
+    """)
+
     try:
-        data = fetch_ministerio_data(api_url)
+        with engine.connect() as conn:
+            result = conn.execute(query_sql, {
+                "user_lat": user_lat,
+                "user_lng": user_lng,
+                "radius_km": radius_km
+            })
+            rows = result.fetchall()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Error al conectar con la API del Ministerio: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al consultar la base de datos: {str(e)}")
 
-    stationsFilter = [normalize_station(station) for station in data.get("ListaEESSPrecio", []) if station.get("Provincia", "").strip().lower() == prov.lower()]
+    if not rows:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No se encontraron estaciones en un radio de {radius_km} km de la ubicación proporcionada."
+        )
 
-    if not stationsFilter:
-        return {"error": f"No se encontraron estaciones en {prov}"}
+    stations_data = []
+    for row in rows:
+        prices_dict = row.prices if isinstance(row.prices, dict) else json.loads(row.prices or "{}")
+        price_val = prices_dict.get(fuel)
+        numeric_price = None
+        if price_val is not None:
+            try:
+                numeric_price = float(str(price_val).replace(",", "."))
+            except ValueError:
+                pass
 
-    valid_stations = [s for s in stationsFilter if s["prices"].get(gasoline_type) is not None]
-    top_baratas = sorted(valid_stations, key=lambda x: x["prices"][gasoline_type])[:10]
+        if numeric_price is not None:
+            lat = str(row.latitude).replace(",", ".") if row.latitude else ""
+            lon = str(row.longitude).replace(",", ".") if row.longitude else ""
+            gmaps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}" if lat and lon else ""
+
+            stations_data.append({
+                "id": row.id,
+                "label": row.label,
+                "city": row.city,
+                "prov": row.prov,
+                "address": row.address,
+                "hours": row.hours,
+                "distancia_km": round(row.distancia_km, 2),
+                "prices": prices_dict,
+                "price": numeric_price,
+                "google_maps_url": gmaps_url
+            })
+
+    if not stations_data:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Se encontraron estaciones en el radio de {radius_km} km, pero ninguna tiene precio disponible para '{fuel}'."
+        )
+    
+    prov_name = stations_data[0]["prov"] or "tu zona"
+    top_baratas = sorted(stations_data, key=lambda x: x["price"])[:10]
+    top_10_prompt_data = [
+        {
+            "nombre": s["label"],
+            "municipio": s["city"],
+            "direccion": s["address"],
+            "horario": s["hours"],
+            "precio": s["price"],
+            "maps_url": s["google_maps_url"]
+        }
+        for s in top_baratas
+    ]
 
     prompt = f"""
     Eres un asistente experto en ahorro de combustible y analista de mercado.
-    A continuación tienes un listado de las 10 gasolineras más baratas en la provincia de {prov.upper()} para el combustible '{gasoline_type}':
+    A continuación tienes un listado de las 10 gasolineras más baratas en la provincia de {prov_name.upper()} para el combustible '{fuel}':
 
-    {top_baratas}
+    {json.dumps(top_10_prompt_data, ensure_ascii=False, indent=2)}
 
-    En formato JSON solo para parsear con json.loads:
-    1. **best_option**: La mejor opción absoluta: Nombre, dirección, municipio, precio, horario y link en google maps.
-    2. **alternative_options**: 2 opciones destacadas (por ejemplo, por horario 24h o marcas reconocidas).
-    3. **saving_advice**: un breve comentario sobre la diferencia de precio entre la más barata y la más cara del TOP 10. También añade aquí cuantos km es factible recorrer para repostar en la más barata.
-    4. **complete_info**: genera un informe breve y estructurado en español orientado al usuario final con los campos anteriores.
+    Devuelve ÚNICAMENTE un objeto JSON con la siguiente estructura (sin formato Markdown, ni triple comilla ```json):
+    {{
+        "best_option": {{
+            "nombre": "string",
+            "direccion": "string",
+            "municipio": "string",
+            "precio": number,
+            "horario": "string",
+            "google_maps_url": "string"
+        }},
+        "alternative_options": [
+            {{
+                "nombre": "string",
+                "motivo": "string",
+                "precio": number,
+                "google_maps_url": "string"
+            }}
+        ],
+        "saving_advice": "string",
+        "complete_info": "string"
+    }}
 
-    Mantén un tono profesional, claro y directo.
+    saving_advice y complete_info deben ser strings con la información relevante para el usuario.
     """
 
     try:
         model = genai.GenerativeModel("gemini-3.6-flash")
         ai_response = model.generate_content(prompt)
 
+        cleaned_response = ai_response.text.strip()
+        if cleaned_response.startswith("```"):
+            cleaned_response = cleaned_response.strip("`").replace("json\n", "", 1).strip()
+
+        ia_parsed = json.loads(cleaned_response)
+
         return {
-            "province": prov,
-            "combustible_analizado": gasoline_type,
-            "total_estaciones_provincia": len(stationsFilter),
-            "ia": json.loads(ai_response.text),
+            "ubicacion_usuario": {"lat": user_lat, "lng": user_lng},
+            "radio_km": radius_km,
+            "provincia_detectada": prov_name,
+            "combustible_analizado": fuel,
+            "total_estaciones_en_radio": len(stations_data),
+            "ia": ia_parsed,
             "top_10_estaciones": top_baratas
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar informe con IA: {str(e)}")
 
 @app.get("/cron/update-data")
-def cron_update_gas_stations(authorization: Optional[str] = Header(None)):
+def cron_update_gas_stations(
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None)
+):
     if not engine:
         raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
 
-    try:
-        data = fetch_ministerio_data(api_url)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Error al conectar con la API del Ministerio: {str(e)}")
+    cron_secret = os.getenv("CRON_SECRET")
+    if cron_secret:
+        expected_header = f"Bearer {cron_secret}"
+        if not authorization or not secrets.compare_digest(authorization, expected_header):
+            raise HTTPException(status_code=401, detail="No autorizado")
+        
+    background_tasks.add_task(process_all_provinces)
 
-    raw_stations = [normalize_station(station) for station in data.get("ListaEESSPrecio", []) if station.get("IDEESS")]
-
-    # Preparar lotes de datos para inserción masiva (Batch Insert)
-    batch_estaciones = [
-        {
-            "id": st["id"],
-            "label": st["label"],
-            "city": st["city"],
-            "prov": st["prov"],
-            "cp": st["cp"],
-            "address": st["address"],
-            "latitude": st["latitude"],
-            "longitude": st["longitude"],
-            "hours": st["hours"],
-        }
-        for st musical in raw_stations if (st := musical)
-    ]
-
-    batch_precios = [
-        {
-            "estacion_id": st["id"],
-            "prices": json.dumps(st["prices"])
-        }
-        for st in raw_stations
-    ]
-
-    # Ejecutar upserts masivos en 2 llamadas a la BDD en lugar de 24.000
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO estaciones (id, label, city, prov, cp, address, latitude, longitude, hours)
-                VALUES (:id, :label, :city, :prov, :cp, :address, :latitude, :longitude, :hours)
-                ON CONFLICT (id) DO UPDATE SET
-                    label = EXCLUDED.label,
-                    city = EXCLUDED.city,
-                    prov = EXCLUDED.prov,
-                    cp = EXCLUDED.cp,
-                    address = EXCLUDED.address,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    hours = EXCLUDED.hours,
-                    updated_at = CURRENT_TIMESTAMP;
-            """),
-            batch_estaciones
-        )
-
-        conn.execute(
-            text("""
-                INSERT INTO precios (estacion_id, prices)
-                VALUES (:estacion_id, :prices::jsonb)
-                ON CONFLICT (estacion_id) DO UPDATE SET
-                    prices = EXCLUDED.prices,
-                    updated_at = CURRENT_TIMESTAMP;
-            """),
-            batch_precios
-        )
-
-    return {"status": "success", "total_procesadas": len(raw_stations)}
+    return {
+        "status": "accepted",
+        "message": "Actualización nacional iniciada en segundo plano para las 52 provincias."
+    }
