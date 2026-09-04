@@ -1,24 +1,43 @@
 import os
 import json
+import re
 import time
 import io
 import secrets
+import hashlib
+import math
+
+from functools import lru_cache
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Response, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
-import google.generativeai as genai
+
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
+
+import requests
+import httpx
 from curl_cffi import requests as curl_requests
 
-# INIT ------------
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+from google import genai
+from google.genai import types
+
+from dotenv import load_dotenv
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
+# ------------ INIT ------------ #
 app = FastAPI(title="Gasolineras IA API", version="1.0.0")
+
+# 1. Config Rate Limiter and middleware
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,14 +45,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-api_url = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/FiltroProvincia/"
 
+# 2. Config Database
 engine = None
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL:
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    
     try:
         engine = create_engine(
             DATABASE_URL,
@@ -43,6 +61,12 @@ if DATABASE_URL:
     except Exception as e:
         print(f"Error al inicializar el engine de SQLAlchemy: {e}")
 
+# 3. Config Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# 4. Set Const vars
+API_URL = os.getenv("URL_MINETUR")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -50,7 +74,6 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 }
-
 PROVINCIA_IDS = {
     # "01": "Araba/Álava",
     # "02": "Albacete",
@@ -106,11 +129,12 @@ PROVINCIA_IDS = {
     # "52": "Melilla"
 }
 
-# FUNCTIONS ------------
+# ------------ FUNCTIONS ------------ #
 
-def fetch_ministerio(provincia_id):
+# Fetch data from Minetur API
+def fetch_minetur(provincia_id):
     response = curl_requests.get(
-        f"{api_url}/{provincia_id}", 
+        f"{API_URL}/{provincia_id}", 
         impersonate="chrome120", 
         timeout=30,
         headers=HEADERS
@@ -118,13 +142,16 @@ def fetch_ministerio(provincia_id):
     response.raise_for_status()
     return response.json()
 
+# Chunk list to avoid memory issues
 def chunk_list(data_list, chunk_size=1000):
     for i in range(0, len(data_list), chunk_size):
         yield data_list[i:i + chunk_size]
 
+# Parse price from string to float and handle errors
 def parse_price(val):
     return float(val.replace(",", ".")) if val else None
 
+# Parse coordinate from string to float and handle errors
 def parse_coord(val):
     if not val:
         return None
@@ -133,6 +160,7 @@ def parse_coord(val):
     except (ValueError, TypeError):
         return None
 
+# Normalize station data
 def normalize_station(station):
     return {
         "id": station.get("IDEESS"),
@@ -171,6 +199,7 @@ def normalize_station(station):
         "hours": station.get("Horario", None).strip() if station.get("Horario") else None,
     }
 
+# Process all provinces data and save to database
 def process_all_provinces():
     if not engine:
         print("[CRON] Error: DATABASE_URL no configurada")
@@ -204,7 +233,7 @@ def process_all_provinces():
 
     for prov_id in PROVINCIA_IDS:
         try:
-            data = fetch_ministerio(prov_id)
+            data = fetch_minetur(prov_id)
             raw_stations = [normalize_station(st) for st in data.get("ListaEESSPrecio", []) if st and st.get("IDEESS")]
 
             batch_estaciones = [
@@ -238,26 +267,53 @@ def process_all_provinces():
 
     print(f"[CRON] Finalizada actualización nacional. Total estaciones: {total_procesadas}")
 
+# Generate cache key for geolocation, radius and fuel
+def get_geo_cache_key(lat: float, lng: float, radius: float, fuel: str) -> str:
+    GRID_STEP = 0.05
+    grid_lat = round(math.floor(float(lat) / GRID_STEP) * GRID_STEP, 3)
+    grid_lng = round(math.floor(float(lng) / GRID_STEP) * GRID_STEP, 3)
+    raw_key = f"{grid_lat:.3f}_{grid_lng:.3f}_{float(radius)}_{str(fuel).strip().lower()}"
 
-# ROUTES ------------
+    return hashlib.md5(raw_key.encode("utf-8")).hexdigest()
 
-@app.get("/")
-def home():
-    return {"message": "Gasolineras IA API activa"}
+# ------------ ROUTES ------------ #
 
+# Health check
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "service": "FastAPI + Gemini on Vercel"}
+    return {"status": "ok", "service": "up"}
 
+# Get nearby AI report (limited to 5 requests per minute)
 @app.get("/stations/nearby/report")
-def get_province_ai_report(
+@limiter.limit("5/minute")
+def get_nearby_ai_report(
+    request: Request,
     user_lat: float = 40.252125,
     user_lng: float = -4.189412,
-    radius_km: float = 30,
-    fuel: str = "gasolina_95_e5"
-):
+    radius_km: float = 20,
+    fuel: str = "gasolina_95_e5",
+    response: Response = None
+    ):
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    
     if not engine:
         raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
+
+    cache_key = get_geo_cache_key(user_lat, user_lng, radius_km, fuel)
+    check_cache_sql = text("""
+        SELECT response_json 
+        FROM ai_reports_cache 
+        WHERE cache_key = :key 
+        AND created_at > NOW() - INTERVAL '4 hours';
+    """)
+
+    try:
+        with engine.connect() as conn:
+            cached_result = conn.execute(check_cache_sql, {"key": cache_key}).fetchone()
+            if cached_result:
+                return cached_result.response_json
+    except Exception as e:
+        print(f"Error consultando caché: {e}")
 
     query_sql = text("""
         WITH estaciones_distancia AS (
@@ -342,8 +398,8 @@ def get_province_ai_report(
         )
     
     prov_name = stations_data[0]["prov"] or "tu zona"
-    top_baratas = sorted(stations_data, key=lambda x: x["price"])[:10]
-    top_10_prompt_data = [
+    top_baratas = sorted(stations_data, key=lambda x: x["price"])[:5]
+    top_prompt_data = [
         {
             "nombre": s["label"],
             "municipio": s["city"],
@@ -357,9 +413,9 @@ def get_province_ai_report(
 
     prompt = f"""
     Eres un asistente experto en ahorro de combustible y analista de mercado.
-    A continuación tienes un listado de las 10 gasolineras más baratas en la provincia de {prov_name.upper()} para el combustible '{fuel}':
+    A continuación tienes un listado de las 5 gasolineras más baratas en la provincia de {prov_name.upper()} para el combustible '{fuel}':
 
-    {json.dumps(top_10_prompt_data, ensure_ascii=False, indent=2)}
+    {json.dumps(top_prompt_data, ensure_ascii=False, indent=2)}
 
     Devuelve ÚNICAMENTE un objeto JSON con la siguiente estructura (sin formato Markdown, ni triple comilla ```json):
     {{
@@ -387,32 +443,54 @@ def get_province_ai_report(
     """
 
     try:
-        model = genai.GenerativeModel("gemini-3.6-flash")
-        ai_response = model.generate_content(prompt)
+        ai_response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=types.Part.from_text(text=prompt),
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=5000,
+                response_mime_type="application/json"
+            )
+        )
+        raw_text = ai_response.text.strip() if ai_response and hasattr(ai_response, "text") else ""
+        ia_parsed = json.loads(raw_text)
 
-        cleaned_response = ai_response.text.strip()
-        if cleaned_response.startswith("```"):
-            cleaned_response = cleaned_response.strip("`").replace("json\n", "", 1).strip()
-
-        ia_parsed = json.loads(cleaned_response)
-
-        return {
+        response_data = {
             "ubicacion_usuario": {"lat": user_lat, "lng": user_lng},
             "radio_km": radius_km,
             "provincia_detectada": prov_name,
             "combustible_analizado": fuel,
             "total_estaciones_en_radio": len(stations_data),
             "ia": ia_parsed,
-            "top_10_estaciones": top_baratas
+            "top_estaciones": top_baratas
         }
+
+        save_cache_sql = text("""
+            INSERT INTO ai_reports_cache (cache_key, response_json, created_at)
+            VALUES (:key, CAST(:payload AS jsonb), NOW())
+            ON CONFLICT (cache_key) 
+            DO UPDATE SET response_json = EXCLUDED.response_json, created_at = NOW();
+        """)
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(save_cache_sql, {
+                    "key": cache_key, 
+                    "payload": json.dumps(response_data)
+                })
+        except Exception as e:
+            print(f"Error guardando en caché: {e}")
+
+        return response_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar informe con IA: {str(e)}")
 
+# Cron update gas stations (only for admin)
 @app.get("/cron/update-data")
 def cron_update_gas_stations(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None)
-):
+    ):
     if not engine:
         raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
 
@@ -426,5 +504,5 @@ def cron_update_gas_stations(
 
     return {
         "status": "accepted",
-        "message": "Actualización nacional iniciada en segundo plano para las 52 provincias."
+        "message": f"Actualización nacional iniciada en segundo plano para las {len(PROVINCIA_IDS)} provincias."
     }

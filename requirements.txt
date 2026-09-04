@@ -1,8 +1,10 @@
 fastapi
-httpx
-requests
-curl_cffi
-python-dotenv
-google-generativeai
+uvicorn
 sqlalchemy
 psycopg2-binary
+requests
+httpx
+curl_cffi
+slowapi
+google-genai
+python-dotenv
