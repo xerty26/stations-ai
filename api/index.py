@@ -1,14 +1,19 @@
 import os
 import json
+import re
 import time
 import io
 import secrets
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Query
+import hashlib
+import math
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
+from functools import lru_cache
+from typing import Optional
 from dotenv import load_dotenv
 import google.generativeai as genai
 from sqlalchemy import create_engine, text
+from datetime import datetime, timedelta
 from curl_cffi import requests as curl_requests
 
 # INIT ------------
@@ -26,7 +31,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-api_url = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/FiltroProvincia/"
+API_URL = os.getenv("URL_MINETUR")
 
 engine = None
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -110,7 +115,7 @@ PROVINCIA_IDS = {
 
 def fetch_ministerio(provincia_id):
     response = curl_requests.get(
-        f"{api_url}/{provincia_id}", 
+        f"{API_URL}/{provincia_id}", 
         impersonate="chrome120", 
         timeout=30,
         headers=HEADERS
@@ -238,26 +243,48 @@ def process_all_provinces():
 
     print(f"[CRON] Finalizada actualización nacional. Total estaciones: {total_procesadas}")
 
+def get_geo_cache_key(lat: float, lng: float, radius: float, fuel: str) -> str:
+    GRID_STEP = 0.05
+    grid_lat = round(math.floor(lat / GRID_STEP) * GRID_STEP, 3)
+    grid_lng = round(math.floor(lng / GRID_STEP) * GRID_STEP, 3)
+    raw_key = f"{grid_lat}_{grid_lng}_{radius}_{fuel}"
+
+    return hashlib.md5(raw_key.encode()).hexdigest()
 
 # ROUTES ------------
 
-@app.get("/")
-def home():
-    return {"message": "Gasolineras IA API activa"}
-
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "service": "FastAPI + Gemini on Vercel"}
+    return {"status": "ok", "service": "up"}
 
 @app.get("/stations/nearby/report")
-def get_province_ai_report(
+def get_nearby_ai_report(
+    response: Response,
     user_lat: float = 40.252125,
     user_lng: float = -4.189412,
-    radius_km: float = 30,
+    radius_km: float = 20,
     fuel: str = "gasolina_95_e5"
-):
+    ):
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    
     if not engine:
         raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
+
+    cache_key = get_geo_cache_key(user_lat, user_lng, radius_km, fuel)
+    check_cache_sql = text("""
+        SELECT response_json 
+        FROM ai_reports_cache 
+        WHERE cache_key = :key 
+        AND created_at > NOW() - INTERVAL '4 hours';
+    """)
+
+    try:
+        with engine.connect() as conn:
+            cached_result = conn.execute(check_cache_sql, {"key": cache_key}).fetchone()
+            if cached_result:
+                return cached_result.response_json
+    except Exception as e:
+        print(f"Error consultando caché: {e}")
 
     query_sql = text("""
         WITH estaciones_distancia AS (
@@ -342,8 +369,8 @@ def get_province_ai_report(
         )
     
     prov_name = stations_data[0]["prov"] or "tu zona"
-    top_baratas = sorted(stations_data, key=lambda x: x["price"])[:10]
-    top_10_prompt_data = [
+    top_baratas = sorted(stations_data, key=lambda x: x["price"])[:5]
+    top_prompt_data = [
         {
             "nombre": s["label"],
             "municipio": s["city"],
@@ -357,9 +384,9 @@ def get_province_ai_report(
 
     prompt = f"""
     Eres un asistente experto en ahorro de combustible y analista de mercado.
-    A continuación tienes un listado de las 10 gasolineras más baratas en la provincia de {prov_name.upper()} para el combustible '{fuel}':
+    A continuación tienes un listado de las 5 gasolineras más baratas en la provincia de {prov_name.upper()} para el combustible '{fuel}':
 
-    {json.dumps(top_10_prompt_data, ensure_ascii=False, indent=2)}
+    {json.dumps(top_prompt_data, ensure_ascii=False, indent=2)}
 
     Devuelve ÚNICAMENTE un objeto JSON con la siguiente estructura (sin formato Markdown, ni triple comilla ```json):
     {{
@@ -383,28 +410,47 @@ def get_province_ai_report(
         "complete_info": "string"
     }}
 
-    saving_advice y complete_info deben ser strings con la información relevante para el usuario.
+    saving_advice y complete_info deben ser strings con la información relevante para el usuario y en cada una de ellas se conciso para que no sea más largo de 30 caracteres.
     """
 
     try:
-        model = genai.GenerativeModel("gemini-3.6-flash")
+        generation_config = {
+            "temperature": 0.2,
+            "max_output_tokens": 5000,
+            "response_mime_type": "application/json"
+        }
+        model = genai.GenerativeModel("gemini-3.6-flash", generation_config=generation_config)
         ai_response = model.generate_content(prompt)
+        raw_text = ai_response.text.strip() if ai_response and hasattr(ai_response, "text") else ""
+        ia_parsed = json.loads(raw_text)
 
-        cleaned_response = ai_response.text.strip()
-        if cleaned_response.startswith("```"):
-            cleaned_response = cleaned_response.strip("`").replace("json\n", "", 1).strip()
-
-        ia_parsed = json.loads(cleaned_response)
-
-        return {
+        response_data = {
             "ubicacion_usuario": {"lat": user_lat, "lng": user_lng},
             "radio_km": radius_km,
             "provincia_detectada": prov_name,
             "combustible_analizado": fuel,
             "total_estaciones_en_radio": len(stations_data),
             "ia": ia_parsed,
-            "top_10_estaciones": top_baratas
+            "top_estaciones": top_baratas
         }
+
+        save_cache_sql = text("""
+            INSERT INTO ai_reports_cache (cache_key, response_json, created_at)
+            VALUES (:key, CAST(:payload AS jsonb), NOW())
+            ON CONFLICT (cache_key) 
+            DO UPDATE SET response_json = EXCLUDED.response_json, created_at = NOW();
+        """)
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(save_cache_sql, {
+                    "key": cache_key, 
+                    "payload": json.dumps(response_data)
+                })
+        except Exception as e:
+            print(f"Error guardando en caché: {e}")
+
+        return response_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar informe con IA: {str(e)}")
 
@@ -412,7 +458,7 @@ def get_province_ai_report(
 def cron_update_gas_stations(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None)
-):
+    ):
     if not engine:
         raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
 
