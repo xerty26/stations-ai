@@ -1,32 +1,36 @@
 # stations-ai
 
-API de gasolineras con informes generados por IA. Consulta los precios oficiales del Ministerio de Industria (España), filtra por provincia y tipo de combustible, y usa **Google Gemini** para devolver un resumen con la mejor opción, alternativas y consejos de ahorro.
+Gas station API with AI-generated reports. Stores official fuel prices from Spain’s Ministry of Industry in PostgreSQL, finds stations by geolocation and radius, and uses **Google Gemini** to return a summary with the best option, alternatives, and saving tips.
 
-Desplegada pensada para **Vercel** (FastAPI serverless + cron cada 4 horas).
+Built for **Vercel** (FastAPI serverless + daily cron).
 
 ## Stack
 
 - [FastAPI](https://fastapi.tiangolo.com/)
-- [Google Generative AI (Gemini)](https://ai.google.dev/)
-- Datos oficiales: [API Precios Carburantes (Ministerio)](https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/)
-- Despliegue: Vercel (`vercel.json`)
+- [SQLAlchemy](https://www.sqlalchemy.org/) + PostgreSQL
+- [Google Gen AI (Gemini)](https://ai.google.dev/) (`google-genai`)
+- [slowapi](https://github.com/laurentS/slowapi) (rate limiting)
+- [curl_cffi](https://github.com/lexiforest/curl_cffi) (Minetur fetch)
+- Official data: Fuel Prices API (Spanish Ministry)
+- Deployment: Vercel (`vercel.json`)
 
-## Requisitos
+## Requirements
 
 - Python 3.10+
-- Cuenta / API key de Gemini
-- (Opcional) secreto para proteger el cron y URL de base de datos
+- Gemini API key
+- PostgreSQL with `estaciones`, `precios`, and `ai_reports_cache` tables
+- Secret to protect the cron endpoint
 
-## Configuración
+## Setup
 
-1. Clona el repositorio y entra en el directorio:
+1. Clone the repository and enter the project directory:
 
 ```bash
-git clone <url-del-repo>
+git clone <repo-url>
 cd stations-ai
 ```
 
-2. Crea un entorno virtual e instala dependencias:
+2. Create a virtual environment and install dependencies:
 
 ```bash
 python -m venv venv
@@ -34,101 +38,137 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Copia el ejemplo de variables de entorno y rellénalas:
+3. Copy the environment example and fill in the values:
 
 ```bash
 cp .env.example .env
 ```
 
-| Variable | Descripción |
+| Variable | Description |
 |---|---|
-| `GEMINI_API_KEY` | API key de Google Gemini |
-| `CRON_SECRET` | Token Bearer para autorizar `/api/cron/update-data` |
-| `DATABASE_URL` | URL PostgreSQL (preparada; persistencia aún pendiente) |
+| `GEMINI_API_KEY` | Google Gemini API key |
+| `CRON_SECRET` | Bearer token to authorize `/cron/update-data` |
+| `DATABASE_URL` | PostgreSQL URL (`postgresql://...`; `postgres://` is also accepted) |
+| `URL_MINETUR` | Base URL of the Ministry’s per-province fuel prices API |
 
-## Desarrollo local
+## Local development
 
-Con el entorno activado y el `.env` configurado:
+With the virtualenv activated and `.env` configured:
 
 ```bash
 uvicorn api.index:app --reload --port 8000
 ```
 
-La API queda en `http://localhost:8000`. Documentación interactiva en `/docs` (Swagger) si el entorno lo expone.
+The API is available at `http://localhost:8000`. Interactive docs at `/docs`.
 
 ## Endpoints
 
-### `GET /api/health`
+### `GET /health`
 
-Comprueba que el servicio está vivo.
+Health check.
 
 ```json
-{ "status": "ok", "service": "FastAPI + Gemini on Vercel" }
+{ "status": "ok", "service": "up" }
 ```
 
-### `GET /api/stations/{prov}/report`
+### `GET /stations/nearby/report`
 
-Genera un informe IA de las gasolineras más baratas de una provincia.
+Generates an AI report for the cheapest gas stations near a location.
 
-**Parámetros**
+- Rate limit: **5 requests/minute** per IP
+- Response header: `Cache-Control: public, max-age=3600`
+- DB cache (`ai_reports_cache`) keyed by geo grid (~0.05°) + radius + fuel, valid for **4 hours** (`created_at` in UTC)
 
-| Nombre | Dónde | Ejemplo | Descripción |
-|---|---|---|---|
-| `prov` | path | `madrid` | Provincia (sin acentos, case-insensitive) |
-| `gasoline_type` | query | `gasolina_95_e5` | Clave del combustible a analizar |
+**Query parameters**
 
-**Ejemplo**
+| Name | Example | Description |
+|---|---|---|
+| `user_lat` | `40.252125` | User latitude |
+| `user_lng` | `-4.189412` | User longitude |
+| `radius_km` | `20` | Search radius in km |
+| `fuel` | `gasolina_95_e5` | Fuel key to analyze |
+
+**Example**
 
 ```bash
-curl "http://localhost:8000/api/stations/madrid/report?gasoline_type=gasolina_95_e5"
+curl "http://localhost:8000/stations/nearby/report?user_lat=40.25&user_lng=-4.19&radius_km=20&fuel=gasolina_95_e5"
 ```
 
-**Respuesta (estructura)**
+**Flow**
 
-- `province` — provincia consultada  
-- `combustible_analizado` — tipo de combustible  
-- `total_estaciones_provincia` — estaciones encontradas  
-- `ia` — JSON de Gemini (`best_option`, `alternative_options`, `saving_advice`, `complete_info`)  
-- `top_10_estaciones` — las 10 más baratas normalizadas  
+1. Look up a cached report (`cache_key` = MD5 of grid + radius + fuel).
+2. If no valid cache, query stations within radius (Haversine formula in SQL).
+3. Keep stations with a price for `fuel`, take the **5 cheapest**, and request a Gemini report.
+4. Upsert the result into `ai_reports_cache` and return it.
 
-### `GET /api/cron/update-data`
+**Response shape**
 
-Job pensado para Vercel Cron (cada 4 horas). Requiere cabecera:
+- `ubicacion_usuario` — `{ lat, lng }`
+- `radio_km` — radius used
+- `provincia_detectada` — province of the nearest station with a price
+- `combustible_analizado` — fuel type
+- `total_estaciones_en_radio` — stations with a valid price in the radius
+- `ia` — Gemini JSON (`best_option`, `alternative_options`, `saving_advice`, `complete_info`)
+- `top_estaciones` — top 5 cheapest (includes `distancia_km`, `price`, `google_maps_url`, etc.)
+
+### `GET /cron/update-data`
+
+Sync job (Vercel Cron: **daily at 06:00 UTC**). Requires header:
 
 ```http
 Authorization: Bearer <CRON_SECRET>
 ```
 
-Actualmente responde éxito; la persistencia en BBDD está marcada como TODO.
+Starts `process_all_provinces()` in the background: downloads Minetur data per province, normalizes stations/prices, and upserts into `estaciones` and `precios`.
 
-## Tipos de combustible
+Responds immediately:
 
-Claves disponibles en `prices` (usarlas en `gasoline_type`):
+```json
+{
+  "status": "accepted",
+  "message": "Actualización nacional iniciada en segundo plano para las N provincias."
+}
+```
+
+> In code, `PROVINCIA_IDS` may only enable a subset (e.g. Madrid and Toledo) while testing; the rest are commented out.
+
+## Data model (PostgreSQL)
+
+| Table | Purpose |
+|---|---|
+| `estaciones` | Station metadata (id, label, city, coords, hours…) |
+| `precios` | Price JSONB per `estacion_id` |
+| `ai_reports_cache` | Cached AI reports (`cache_key`, `response_json`, `created_at`) |
+
+## Fuel types
+
+Keys available in `prices` / `fuel` parameter:
 
 `adblue`, `amoniaco`, `biodiesel`, `bioetanol`, `biogas_natural_comprimido`, `biogas_natural_licuado`, `diesel_renovable`, `gas_natural_comprimido`, `gas_natural_licuado`, `gases_licuados_del_petroleo`, `gasoleo_a`, `gasoleo_b`, `gasoleo_premium`, `gasolina_95_e10`, `gasolina_95_e25`, `gasolina_95_e5`, `gasolina_95_e5_premium`, `gasolina_95_e85`, `gasolina_98_e10`, `gasolina_98_e5`, `gasolina_renovable`, `hidrogeno`, `metanol`
 
-## Despliegue en Vercel
+## Deploy on Vercel
 
-1. Conecta el repo a Vercel.
-2. Define las variables de entorno en el panel del proyecto (`GEMINI_API_KEY`, `CRON_SECRET`, etc.).
-3. `vercel.json` ya reescribe `/api/*` a `api/index.py` y programa el cron:
+1. Connect the repo to Vercel.
+2. Set environment variables (`GEMINI_API_KEY`, `CRON_SECRET`, `DATABASE_URL`, `URL_MINETUR`).
+3. `vercel.json` builds `api/index.py` with `@vercel/python`, routes all traffic to that app, and schedules the cron:
 
 ```json
-"schedule": "0 */4 * * *"
+"path": "/cron/update-data",
+"schedule": "0 6 * * *"
 ```
 
-## Estructura
+## Project structure
 
 ```
 stations-ai/
 ├── api/
-│   └── index.py      # App FastAPI (health, report, cron)
+│   └── index.py      # FastAPI: health, nearby/report, cron + Minetur sync
 ├── .env.example
 ├── requirements.txt
 ├── vercel.json
 └── README.md
 ```
 
-## Licencia
+## License
 
-Uso interno / proyecto de prueba. Los datos de precios pertenecen al Ministerio de Industria, Comercio y Turismo.
+Internal / experimental use. Fuel price data belongs to the Spanish Ministry of Industry, Trade and Tourism.
