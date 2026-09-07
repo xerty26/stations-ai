@@ -444,7 +444,7 @@ def get_nearby_ai_report(
 
     try:
         ai_response = client.models.generate_content(
-            model="gemini-3.6-flash",
+            model="gemini-3.5-flash-lite",
             contents=types.Part.from_text(text=prompt),
             config=types.GenerateContentConfig(
                 temperature=0.2,
