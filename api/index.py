@@ -427,19 +427,10 @@ def get_nearby_ai_report(
             "horario": "string",
             "google_maps_url": "string"
         }},
-        "alternative_options": [
-            {{
-                "nombre": "string",
-                "motivo": "string",
-                "precio": number,
-                "google_maps_url": "string"
-            }}
-        ],
-        "saving_advice": "string",
-        "complete_info": "string"
+        "saving_advice": "string"
     }}
 
-    saving_advice y complete_info deben ser strings con la información relevante para el usuario.
+    saving_advice debe ser un string con la información relevante para el usuario.
     """
 
     try:
