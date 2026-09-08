@@ -399,6 +399,16 @@ def get_nearby_ai_report(
     
     prov_name = stations_data[0]["prov"] or "tu zona"
     top_baratas = sorted(stations_data, key=lambda x: x["price"])[:5]
+    mas_cercana = stations_data[0]
+
+    ids_baratas = {s["id"] for s in top_baratas}
+    top_estaciones = list(top_baratas)
+
+    if mas_cercana["id"] not in ids_baratas:
+        mas_cercana_copy = dict(mas_cercana)
+        mas_cercana_copy["es_mas_cercana"] = True
+        top_estaciones.append(mas_cercana_copy)
+
     top_prompt_data = [
         {
             "nombre": s["label"],
@@ -408,13 +418,17 @@ def get_nearby_ai_report(
             "precio": s["price"],
             "maps_url": s["google_maps_url"]
         }
-        for s in top_baratas
+        for s in top_estaciones
     ]
 
     prompt = f"""
     Eres un asistente experto en ahorro de combustible y analista de mercado.
-    A continuación tienes un listado de las 5 gasolineras más baratas en la provincia de {prov_name.upper()} para el combustible '{fuel}':
+    A continuación tienes un listado de las gasolineras más baratas en la zona indicada para el combustible '{fuel}'.
+    Incluye las opciones más baratas y la gasolinera más cercana como referencia:
 
+    Referencia más cercana: {mas_cercana['label']} a {mas_cercana['distancia_km']} km ({mas_cercana['price']} €/L).
+
+    Listado de las gasolineras actualizado:
     {json.dumps(top_prompt_data, ensure_ascii=False, indent=2)}
 
     Devuelve ÚNICAMENTE un objeto JSON con la siguiente estructura (sin formato Markdown, ni triple comilla ```json):
@@ -453,7 +467,7 @@ def get_nearby_ai_report(
             "combustible_analizado": fuel,
             "total_estaciones_en_radio": len(stations_data),
             "ia": ia_parsed,
-            "top_estaciones": top_baratas
+            "top_estaciones": top_estaciones
         }
 
         save_cache_sql = text("""
