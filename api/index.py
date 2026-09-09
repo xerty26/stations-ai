@@ -38,9 +38,17 @@ app = FastAPI(title="Gasolineras IA API", version="1.0.0")
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+origins = [
+    "http://localhost:5173",
+    "https://gasoneclick.es",
+    "https://www.gasoneclick.es",
+]
+vercel_regex = r"https://.*\.vercel\.app"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_origin_regex=vercel_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
