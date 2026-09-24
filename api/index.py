@@ -519,3 +519,40 @@ def cron_update_gas_stations(
         "status": "accepted",
         "message": f"Actualización nacional iniciada en segundo plano para las {len(PROVINCIA_IDS)} provincias."
     }
+
+# Generate sitemap.xml
+@app.get("/sitemap.xml", response_class=Response)
+async def generate_sitemap():
+    base_url = "https://gasoneclick.es"
+    static_pages = [
+        {"loc": f"{base_url}/", "priority": "1.0", "changefreq": "daily"},
+        {"loc": f"{base_url}/legal", "priority": "0.3", "changefreq": "monthly"},
+    ]
+    
+    # TODO: Add dynamic pages
+    # 2. URLs Dinámicas (Provincias / Municipios)
+    # dynamic_pages = [
+    #     {
+    #         "loc": f"{base_url}/gasolineras/{provincia}",
+    #         "priority": "0.8",
+    #         "changefreq": "daily"
+    #     }
+    #     for provincia in PROVINCIAS
+    # ]
+    
+    # all_pages = static_pages + dynamic_pages
+    all_pages = static_pages;
+
+    xml_content = '<?xml version="1.0" encoding="UTF-8"?>\n'
+    xml_content += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    
+    for page in all_pages:
+        xml_content += f'  <url>\n'
+        xml_content += f'    <loc>{page["loc"]}</loc>\n'
+        xml_content += f'    <changefreq>{page["changefreq"]}</changefreq>\n'
+        xml_content += f'    <priority>{page["priority"]}</priority>\n'
+        xml_content += f'  </url>\n'
+        
+    xml_content += '</urlset>'
+
+    return Response(content=xml_content, media_type="application/xml")
