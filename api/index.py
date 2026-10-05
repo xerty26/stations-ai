@@ -6,6 +6,7 @@ import io
 import secrets
 import hashlib
 import math
+import unicodedata
 
 from functools import lru_cache
 from typing import Optional
@@ -58,8 +59,8 @@ app.add_middleware(
 engine = None
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL:
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    # Explicit driver: SQLAlchemy 2.1+ defaults "postgresql://" to psycopg 3, but only psycopg2 is installed
+    DATABASE_URL = re.sub(r"^postgres(ql)?://", "postgresql+psycopg2://", DATABASE_URL)
     try:
         engine = create_engine(
             DATABASE_URL,
@@ -284,6 +285,25 @@ def get_geo_cache_key(lat: float, lng: float, radius: float, fuel: str) -> str:
 
     return hashlib.md5(raw_key.encode("utf-8")).hexdigest()
 
+PROVINCE_FUELS = ["gasoleo_a", "gasolina_95_e5", "gasolina_98_e5", "gasoleo_premium"]
+
+# Build URL slug from province name (e.g. "coruña (a)" -> "coruna-a")
+def slugify(value: str) -> str:
+    ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_value.lower()).strip("-")
+
+# Provinces with stations in database
+def get_provinces():
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT prov, COUNT(*) AS stations
+            FROM estaciones
+            WHERE prov IS NOT NULL AND prov <> ''
+            GROUP BY prov
+            ORDER BY prov;
+        """)).fetchall()
+    return [{"slug": slugify(row.prov), "name": row.prov, "stations": row.stations} for row in rows]
+
 # ------------ ROUTES ------------ #
 
 # Health check
@@ -498,6 +518,88 @@ def get_nearby_ai_report(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar informe con IA: {str(e)}")
 
+# List provinces with data
+@app.get("/stations/provinces")
+@limiter.limit("30/minute")
+def list_provinces(request: Request, response: Response):
+    response.headers["Cache-Control"] = "public, max-age=3600"
+
+    if not engine:
+        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
+
+    try:
+        return get_provinces()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al consultar la base de datos: {str(e)}")
+
+# Price summary for a province (no AI)
+@app.get("/stations/province/{slug}")
+@limiter.limit("30/minute")
+def get_province_summary(slug: str, request: Request, response: Response):
+    response.headers["Cache-Control"] = "public, max-age=3600"
+
+    if not engine:
+        raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
+
+    try:
+        province = next((p for p in get_provinces() if p["slug"] == slug), None)
+        if not province:
+            raise HTTPException(status_code=404, detail=f"No hay datos para la provincia '{slug}'.")
+
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT e.id, e.label, e.city, e.address, e.hours, e.latitude, e.longitude, p.prices, p.updated_at
+                FROM estaciones e
+                JOIN precios p ON e.id = p.estacion_id
+                WHERE e.prov = :prov;
+            """), {"prov": province["name"]}).fetchall()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al consultar la base de datos: {str(e)}")
+
+    fuels = {}
+    for fuel in PROVINCE_FUELS:
+        priced = []
+        for row in rows:
+            prices_dict = row.prices if isinstance(row.prices, dict) else json.loads(row.prices or "{}")
+            price = prices_dict.get(fuel)
+            if price is None:
+                continue
+            lat = str(row.latitude).replace(",", ".") if row.latitude else ""
+            lon = str(row.longitude).replace(",", ".") if row.longitude else ""
+            priced.append({
+                "id": row.id,
+                "label": row.label,
+                "city": row.city,
+                "address": row.address,
+                "hours": row.hours,
+                "price": float(price),
+                "google_maps_url": f"https://www.google.com/maps/search/?api=1&query={lat},{lon}" if lat and lon else ""
+            })
+
+        if not priced:
+            continue
+
+        prices = [st["price"] for st in priced]
+        fuels[fuel] = {
+            "stations": len(priced),
+            "avg": round(sum(prices) / len(prices), 3),
+            "min": min(prices),
+            "max": max(prices),
+            "top": sorted(priced, key=lambda st: st["price"])[:10]
+        }
+
+    updated_at = max((row.updated_at for row in rows if row.updated_at), default=None)
+
+    return {
+        "slug": province["slug"],
+        "name": province["name"],
+        "total_estaciones": province["stations"],
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "fuels": fuels
+    }
+
 # Cron update gas stations (only for admin)
 @app.get("/cron/update-data")
 def cron_update_gas_stations(
@@ -522,26 +624,25 @@ def cron_update_gas_stations(
 
 # Generate sitemap.xml
 @app.get("/sitemap.xml", response_class=Response)
-async def generate_sitemap():
-    base_url = "https://gasoneclick.es"
+def generate_sitemap():
+    base_url = "https://www.gasoneclick.es"
     static_pages = [
         {"loc": f"{base_url}/", "priority": "1.0", "changefreq": "daily"},
+        {"loc": f"{base_url}/gasolineras", "priority": "0.8", "changefreq": "weekly"},
         {"loc": f"{base_url}/legal", "priority": "0.3", "changefreq": "monthly"},
     ]
-    
-    # TODO: Add dynamic pages
-    # 2. URLs Dinámicas (Provincias / Municipios)
-    # dynamic_pages = [
-    #     {
-    #         "loc": f"{base_url}/gasolineras/{provincia}",
-    #         "priority": "0.8",
-    #         "changefreq": "daily"
-    #     }
-    #     for provincia in PROVINCIAS
-    # ]
-    
-    # all_pages = static_pages + dynamic_pages
-    all_pages = static_pages;
+
+    dynamic_pages = []
+    if engine:
+        try:
+            dynamic_pages = [
+                {"loc": f"{base_url}/gasolineras/{province['slug']}", "priority": "0.8", "changefreq": "daily"}
+                for province in get_provinces()
+            ]
+        except Exception as e:
+            print(f"Error obteniendo provincias para el sitemap: {e}")
+
+    all_pages = static_pages + dynamic_pages
 
     xml_content = '<?xml version="1.0" encoding="UTF-8"?>\n'
     xml_content += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'

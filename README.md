@@ -111,6 +111,14 @@ curl "http://localhost:8000/stations/nearby/report?user_lat=40.25&user_lng=-4.19
 - `ia` — Gemini JSON (`best_option`, `alternative_options`, `saving_advice`, `complete_info`)
 - `top_estaciones` — top 5 cheapest (includes `distancia_km`, `price`, `google_maps_url`, etc.)
 
+### `GET /stations/provinces`
+
+Provinces that have stations in the database: `[{ slug, name, stations }]`. Rate limit: 30 requests/minute per IP.
+
+### `GET /stations/province/{slug}`
+
+Price summary for one province, without AI. Returns `slug`, `name`, `total_estaciones`, `updated_at` and `fuels`. For each of `gasoleo_a`, `gasolina_95_e5`, `gasolina_98_e5` and `gasoleo_premium`, `fuels` holds `stations`, `avg`, `min`, `max` and the 10 cheapest stations in `top`. Returns 404 if the province has no data. Rate limit: 30 requests/minute per IP.
+
 ### `GET /cron/update-data`
 
 Sync job (Vercel Cron: **daily at 06:00 UTC**). Requires header:
@@ -162,7 +170,7 @@ Keys available in `prices` / `fuel` parameter:
 ```
 stations-ai/
 ├── api/
-│   └── index.py      # FastAPI: health, nearby/report, cron + Minetur sync
+│   └── index.py      # FastAPI: health, nearby/report, provinces, sitemap, cron + Minetur sync
 ├── .env.example
 ├── requirements.txt
 ├── vercel.json
