@@ -1,31 +1,17 @@
 {
-    "version": 2,
-    "builds": [
-        {
-            "src": "api/index.py",
-            "use": "@vercel/python"
+    "functions": {
+        "api/index.py": {
+            "maxDuration": 300
         }
-    ],
+    },
     "crons": [
         {
             "path": "/cron/update-data",
             "schedule": "0 6 * * *"
-        }
-    ],
-    "routes": [
-        {
-            "src": "/(.*)",
-            "dest": "api/index.py"
-        }
-    ],
-    "rewrites": [
-        {
-            "source": "/sitemap.xml",
-            "destination": "https://api.gasoneclick.es/sitemap.xml"
         },
         {
-            "source": "/(.*)",
-            "destination": "/index.html"
+            "path": "/cron/update-data",
+            "schedule": "0 11 * * *"
         }
     ]
 }

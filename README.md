@@ -121,24 +121,23 @@ Price summary for one province, without AI. Returns `slug`, `name`, `total_estac
 
 ### `GET /cron/update-data`
 
-Sync job (Vercel Cron: **daily at 06:00 UTC**). Requires header:
+Sync job (Vercel Cron: **daily at 06:00 and 11:00 UTC**; on Hobby each run can start anywhere within that hour). Requires header:
 
 ```http
 Authorization: Bearer <CRON_SECRET>
 ```
 
-Starts `process_all_provinces()` in the background: downloads Minetur data per province, normalizes stations/prices, and upserts into `estaciones` and `precios`.
-
-Responds immediately:
+Runs `process_all_provinces()` synchronously. For each of the 52 provinces it downloads the Minetur data, normalizes stations and prices, and upserts them into `estaciones` and `precios` in batches of 1000 rows (`execute_values`). A full run takes about 30 seconds, most of it spent downloading. It responds once the run has finished:
 
 ```json
 {
-  "status": "accepted",
-  "message": "Actualización nacional iniciada en segundo plano para las N provincias."
+  "status": "ok",
+  "provincias": 52,
+  "estaciones": 11509,
+  "segundos": 30.2,
+  "provincias_con_error": []
 }
 ```
-
-> In code, `PROVINCIA_IDS` may only enable a subset (e.g. Madrid and Toledo) while testing; the rest are commented out.
 
 ## Data model (PostgreSQL)
 
@@ -158,12 +157,14 @@ Keys available in `prices` / `fuel` parameter:
 
 1. Connect the repo to Vercel.
 2. Set environment variables (`GEMINI_API_KEY`, `CRON_SECRET`, `DATABASE_URL`, `URL_MINETUR`).
-3. `vercel.json` builds `api/index.py` with `@vercel/python`, routes all traffic to that app, and schedules the cron:
+3. `pyproject.toml` points Vercel to the FastAPI app (`entrypoint = "api.index:app"`), which deploys as a single function serving every route. `vercel.json` allows that function to run for up to 300 s (the Hobby limit) and schedules the cron:
 
 ```json
 "path": "/cron/update-data",
 "schedule": "0 6 * * *"
 ```
+
+A second entry with `"schedule": "0 11 * * *"` runs the same sync at midday.
 
 ## Project structure
 

@@ -12,11 +12,12 @@ from functools import lru_cache
 from typing import Optional
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Response, Request, Query
+from fastapi import FastAPI, HTTPException, Header, Response, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
+from psycopg2.extras import execute_values
 
 import requests
 import httpx
@@ -84,58 +85,58 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 PROVINCIA_IDS = {
-    # "01": "Araba/Álava",
-    # "02": "Albacete",
-    # "03": "Alicante/Alacant",
-    # "04": "Almería",
-    # "05": "Ávila",
-    # "06": "Badajoz",
-    # "07": "Balears (Illes)",
-    #"08": "Barcelona",
-    # "09": "Burgos",
-    # "10": "Cáceres",
-    # "11": "Cádiz",
-    # "12": "Castellón/Castelló",
-    # "13": "Ciudad Real",
-    # "14": "Córdoba",
-    # "15": "Coruña (A)",
-    # "16": "Cuenca",
-    # "17": "Girona",
-    # "18": "Granada",
-    # "19": "Guadalajara",
-    # "20": "Gipuzkoa",
-    # "21": "Huelva",
-    # "22": "Huesca",
-    # "23": "Jaén",
-    # "24": "León",
-    # "25": "Lleida",
-    # "26": "Rioja (La)",
-    # "27": "Lugo",
+    "01": "Araba/Álava",
+    "02": "Albacete",
+    "03": "Alicante/Alacant",
+    "04": "Almería",
+    "05": "Ávila",
+    "06": "Badajoz",
+    "07": "Balears (Illes)",
+    "08": "Barcelona",
+    "09": "Burgos",
+    "10": "Cáceres",
+    "11": "Cádiz",
+    "12": "Castellón/Castelló",
+    "13": "Ciudad Real",
+    "14": "Córdoba",
+    "15": "Coruña (A)",
+    "16": "Cuenca",
+    "17": "Girona",
+    "18": "Granada",
+    "19": "Guadalajara",
+    "20": "Gipuzkoa",
+    "21": "Huelva",
+    "22": "Huesca",
+    "23": "Jaén",
+    "24": "León",
+    "25": "Lleida",
+    "26": "Rioja (La)",
+    "27": "Lugo",
     "28": "Madrid",
-    # "29": "Málaga",
-    # "30": "Murcia",
-    # "31": "Navarra",
-    # "32": "Ourense",
-    # "33": "Asturias",
-    # "34": "Palencia",
-    # "35": "Palmas (Las)",
-    # "36": "Pontevedra",
-    # "37": "Salamanca",
-    # "38": "Santa Cruz de Tenerife",
-    # "39": "Cantabria",
-    # "40": "Segovia",
-    # "41": "Sevilla",
-    # "42": "Soria",
-    # "43": "Tarragona",
-    # "44": "Teruel",
+    "29": "Málaga",
+    "30": "Murcia",
+    "31": "Navarra",
+    "32": "Ourense",
+    "33": "Asturias",
+    "34": "Palencia",
+    "35": "Palmas (Las)",
+    "36": "Pontevedra",
+    "37": "Salamanca",
+    "38": "Santa Cruz de Tenerife",
+    "39": "Cantabria",
+    "40": "Segovia",
+    "41": "Sevilla",
+    "42": "Soria",
+    "43": "Tarragona",
+    "44": "Teruel",
     "45": "Toledo",
-    # "46": "Valencia/València",
-    # "47": "Valladolid",
-    # "48": "Bizkaia",
-    # "49": "Zamora",
-    # "50": "Zaragoza",
-    # "51": "Ceuta",
-    # "52": "Melilla"
+    "46": "Valencia/València",
+    "47": "Valladolid",
+    "48": "Bizkaia",
+    "49": "Zamora",
+    "50": "Zaragoza",
+    "51": "Ceuta",
+    "52": "Melilla"
 }
 
 # ------------ FUNCTIONS ------------ #
@@ -210,16 +211,15 @@ def normalize_station(station):
 
 # Process all provinces data and save to database
 def process_all_provinces():
-    if not engine:
-        print("[CRON] Error: DATABASE_URL no configurada")
-        return
-
     print("[CRON] Iniciando actualización completa de España...")
+    started = time.time()
     total_procesadas = 0
+    errores = []
 
-    stmt_estaciones = text("""
+    # execute_values sends each page of rows in a single statement instead of one round trip per row
+    sql_estaciones = """
         INSERT INTO estaciones (id, label, city, prov, cp, address, latitude, longitude, hours)
-        VALUES (:id, :label, :city, :prov, :cp, :address, :latitude, :longitude, :hours)
+        VALUES %s
         ON CONFLICT (id) DO UPDATE SET
             label = EXCLUDED.label,
             city = EXCLUDED.city,
@@ -230,20 +230,26 @@ def process_all_provinces():
             longitude = EXCLUDED.longitude,
             hours = EXCLUDED.hours,
             updated_at = CURRENT_TIMESTAMP;
-    """)
+    """
+    template_estaciones = "(%(id)s, %(label)s, %(city)s, %(prov)s, %(cp)s, %(address)s, %(latitude)s, %(longitude)s, %(hours)s)"
 
-    stmt_precios = text("""
+    sql_precios = """
         INSERT INTO precios (estacion_id, prices)
-        VALUES (:estacion_id, CAST(:prices AS jsonb))
+        VALUES %s
         ON CONFLICT (estacion_id) DO UPDATE SET
             prices = EXCLUDED.prices,
             updated_at = CURRENT_TIMESTAMP;
-    """)
+    """
+    template_precios = "(%(estacion_id)s, CAST(%(prices)s AS jsonb))"
 
     for prov_id in PROVINCIA_IDS:
         try:
             data = fetch_minetur(prov_id)
-            raw_stations = [normalize_station(st) for st in data.get("ListaEESSPrecio", []) if st and st.get("IDEESS")]
+            # Dedupe by id: ON CONFLICT cannot update the same row twice in one statement
+            stations = {
+                st["id"]: st
+                for st in (normalize_station(raw) for raw in data.get("ListaEESSPrecio", []) if raw and raw.get("IDEESS"))
+            }.values()
 
             batch_estaciones = [
                 {
@@ -251,7 +257,7 @@ def process_all_provinces():
                     "prov": st["prov"], "cp": st["cp"], "address": st["address"],
                     "latitude": st["latitude"], "longitude": st["longitude"], "hours": st["hours"]
                 }
-                for st in raw_stations if st.get("id")
+                for st in stations
             ]
 
             batch_precios = [
@@ -259,22 +265,31 @@ def process_all_provinces():
                     "estacion_id": st["id"],
                     "prices": json.dumps(st["prices"])
                 }
-                for st in raw_stations if st.get("id")
+                for st in stations
             ]
 
-            with engine.begin() as conn:
-                if batch_estaciones:
-                    conn.execute(stmt_estaciones, batch_estaciones)
-                if batch_precios:
-                    conn.execute(stmt_precios, batch_precios)
+            conn = engine.raw_connection()
+            try:
+                with conn.cursor() as cur:
+                    if batch_estaciones:
+                        execute_values(cur, sql_estaciones, batch_estaciones, template=template_estaciones, page_size=1000)
+                    if batch_precios:
+                        execute_values(cur, sql_precios, batch_precios, template=template_precios, page_size=1000)
+                conn.commit()
+            finally:
+                conn.close()
 
-            total_procesadas += len(raw_stations)
+            total_procesadas += len(batch_estaciones)
             time.sleep(0.1)
 
         except Exception as e:
+            errores.append(prov_id)
             print(f"[CRON] Error procesando provincia {prov_id}: {e}")
 
-    print(f"[CRON] Finalizada actualización nacional. Total estaciones: {total_procesadas}")
+    elapsed = round(time.time() - started, 1)
+    print(f"[CRON] Finalizada actualización nacional en {elapsed}s. Total estaciones: {total_procesadas}. Provincias con error: {errores}")
+
+    return {"estaciones": total_procesadas, "segundos": elapsed, "provincias_con_error": errores}
 
 # Generate cache key for geolocation, radius and fuel
 def get_geo_cache_key(lat: float, lng: float, radius: float, fuel: str) -> str:
@@ -601,11 +616,9 @@ def get_province_summary(slug: str, request: Request, response: Response):
     }
 
 # Cron update gas stations (only for admin)
+# Runs synchronously: on serverless, work scheduled after the response is not guaranteed to finish
 @app.get("/cron/update-data")
-def cron_update_gas_stations(
-    background_tasks: BackgroundTasks,
-    authorization: Optional[str] = Header(None)
-    ):
+def cron_update_gas_stations(authorization: Optional[str] = Header(None)):
     if not engine:
         raise HTTPException(status_code=500, detail="DATABASE_URL no configurada")
 
@@ -614,13 +627,10 @@ def cron_update_gas_stations(
         expected_header = f"Bearer {cron_secret}"
         if not authorization or not secrets.compare_digest(authorization, expected_header):
             raise HTTPException(status_code=401, detail="No autorizado")
-        
-    background_tasks.add_task(process_all_provinces)
 
-    return {
-        "status": "accepted",
-        "message": f"Actualización nacional iniciada en segundo plano para las {len(PROVINCIA_IDS)} provincias."
-    }
+    result = process_all_provinces()
+
+    return {"status": "ok", "provincias": len(PROVINCIA_IDS), **result}
 
 # Generate sitemap.xml
 @app.get("/sitemap.xml", response_class=Response)
